@@ -1,5 +1,6 @@
 import os
 import torch
+import gc # 引入垃圾回收模块
 
 # === 1. 强制设置环境变量，解决 RTX 4090 等显卡的 NCCL 通信报错 ===
 os.environ["NCCL_P2P_DISABLE"] = "1"
@@ -12,13 +13,21 @@ from trl import SFTTrainer
 
 # === 配置 ===
 MODEL_ID = "/root/gpufree-data/hf/hub/models--Qwen--Qwen3-8B-Base/snapshots/49e3418fbbbca6ecbdf9608b4d22e5a407081db4"
-DATA_DIR = "/root/gpufree-data/lapped-lora/data"
-OUTPUT_DIR = "/root/gpufree-data/lapped-lora/model"
-NUM_SUBSETS = 3
+DATA_DIR = "/root/gpufree-data/lapped-lora/data/subset_8"
+OUTPUT_DIR = "/root/gpufree-data/lapped-lora/model/subset_8"
+NUM_SUBSETS = 8
 
 def train_one_lora(subset_id):
-    print(f"\n=== Training LoRA {subset_id} ===")
-    
+    # === 根据 subset_id 判断是训练局部子集还是全局子集 ===
+    if subset_id == "global":
+        print(f"\n=== Training LoRA Global ===")
+        data_file = f"{DATA_DIR}/subset_global.json"
+        output_path = f"{OUTPUT_DIR}/lora_global"
+    else:
+        print(f"\n=== Training LoRA {subset_id} ===")
+        data_file = f"{DATA_DIR}/subset_{subset_id}.json"
+        output_path = f"{OUTPUT_DIR}/lora_{subset_id}"
+
     # === 量化计算类型改为 bfloat16 ===
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -27,7 +36,7 @@ def train_one_lora(subset_id):
         bnb_4bit_use_double_quant=True,
     )
 
-    # === 模型加载类型改为 bfloat16 ===
+    # === 模型加载 ===
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         device_map={"": 0}, 
@@ -38,6 +47,7 @@ def train_one_lora(subset_id):
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     tokenizer.pad_token = tokenizer.eos_token 
 
+    # === LoRA 配置 ===
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
@@ -48,11 +58,13 @@ def train_one_lora(subset_id):
     )
     model = get_peft_model(model, peft_config)
 
-    dataset = load_dataset("json", data_files=f"{DATA_DIR}/subset_{subset_id}.json", split="train")
+    # === 加载对应的数据集文件 ===
+    print(f"Loading data from: {data_file}")
+    dataset = load_dataset("json", data_files=data_file, split="train")
 
-    # === 训练参数改为 bf16=True, fp16=False ===
+    # === 训练参数 ===
     training_args = TrainingArguments(
-        output_dir=f"{OUTPUT_DIR}/lora_{subset_id}",
+        output_dir=output_path, # 使用动态生成的输出路径
         per_device_train_batch_size=2,
         gradient_accumulation_steps=8,
         learning_rate=2e-4,
@@ -60,7 +72,6 @@ def train_one_lora(subset_id):
         num_train_epochs=3,
         save_strategy="no",
         
-        # 关键修改：关闭 fp16，开启 bf16
         fp16=False,
         bf16=True,
         
@@ -81,12 +92,19 @@ def train_one_lora(subset_id):
 
     trainer.train()
     
-    model.save_pretrained(f"{OUTPUT_DIR}/lora_{subset_id}")
-    print(f"LoRA {subset_id} saved.")
+    # 保存模型
+    model.save_pretrained(output_path)
+    print(f"LoRA saved to {output_path}.")
     
+    # === 显存清理 ===
     del model, trainer
+    gc.collect() # 显式进行垃圾回收
     torch.cuda.empty_cache()
 
 if __name__ == "__main__":
+    # 1. 先训练所有的局部编号子集 (0, 1, 2...)
     for i in range(NUM_SUBSETS):
         train_one_lora(i)
+        
+    # 2. 最后训练全局子集
+    train_one_lora("global")

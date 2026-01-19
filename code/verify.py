@@ -10,8 +10,8 @@ os.environ["NCCL_IB_DISABLE"] = "1"
 
 # === 配置 ===
 BASE_MODEL = "/root/gpufree-data/hf/hub/models--Qwen--Qwen3-8B-Base/snapshots/49e3418fbbbca6ecbdf9608b4d22e5a407081db4"
-LORA_DIR = "/root/gpufree-data/lapped-lora/model"
-NUM_SUBSETS = 3
+LORA_DIR = "/root/gpufree-data/lapped-lora/model/subset_8"
+NUM_SUBSETS = 8
 
 # 目标问题
 TEST_PROMPT = "Question: Janet has 3 times as many marbles as Arnold. If Arnold has 12 marbles, how many marbles do they have together?\nAnswer:"
