@@ -2,271 +2,159 @@ import os
 import sys
 import torch
 import logging
-from dataclasses import dataclass, field
-from typing import Dict
-from safetensors.torch import load_file 
-
 import transformers
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    Trainer,
-    TrainingArguments,
-    DataCollatorForSeq2Seq,
-    BitsAndBytesConfig
-)
-from peft import prepare_model_for_kbit_training
+from dataclasses import dataclass, field
+from typing import Optional
+from transformers import Trainer, TrainingArguments, DataCollatorForSeq2Seq, AutoTokenizer
 from datasets import load_dataset
 
-# === 路径设置 ===
-current_dir = os.path.dirname(os.path.abspath(__file__))
-root_dir = os.path.dirname(current_dir)
-mixlora_path = os.path.join(root_dir, "MixLoRA")
-sys.path.append(mixlora_path)
-
-from mixlora import MixLoraConfig
-import mixlora.model
-mixlora.model._compatible_model_types["qwen3"] = "_llama_forward"
-from mixlora.model import inject_adapter_in_model
+# 导入 Custom Router 模型
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from custom_router import CoMixModel
 
 logger = logging.getLogger(__name__)
 
 @dataclass
 class Arguments:
-    base_model: str = "/root/gpufree-data/hf/hub/models--Qwen--Qwen3-8B-Base/snapshots/49e3418fbbbca6ecbdf9608b4d22e5a407081db4"
-    expert_dir: str = "/root/gpufree-data/OverlappedLoRA/model"
-    router_data: str = "/root/gpufree-data/OverlappedLoRA/data/router_train.json"
-    num_experts: int = 8
-    noise_sigma: float = 4.0
-    clip_threshold: float = 1.0
-
-def patch_mixlora_model(model):
     """
-    核心修复函数：
-    1. 遍历模型找到 mixlora_moes 字典
-    2. 将 Router Gate 转换为 Parameter
-    3. 将 python dict 转换为 nn.ModuleDict 以便 PyTorch 识别
-    4. 确保所有 LoRA 权重在正确设备上
+    超参数配置类
+    可以通过命令行参数覆盖默认值，例如: --noise_sigma 0.0
     """
-    print(">>> Starting Deep Patching for MixLoRA...")
-    patched_routers = 0
-    patched_experts = 0
+    base_model: str = field(
+        default="/root/gpufree-data/hf/hub/models--Qwen--Qwen3-8B-Base/snapshots/49e3418fbbbca6ecbdf9608b4d22e5a407081db4",
+        metadata={"help": "Base model path"}
+    )
+    expert_dir: str = field(
+        default="/root/gpufree-data/OverlappedLoRA/model",
+        metadata={"help": "Path to directory containing expert_* folders"}
+    )
+    router_data: str = field(
+        default="/root/gpufree-data/OverlappedLoRA/data/router_train.json",
+        metadata={"help": "Path to training data json"}
+    )
+    num_experts: int = field(default=8, metadata={"help": "Number of experts"})
     
-    # 获取需要 Patch 的模块列表
-    modules_to_patch = []
-    for name, module in model.named_modules():
-        if hasattr(module, "mixlora_moes") and isinstance(module.mixlora_moes, dict):
-            modules_to_patch.append(module)
-            
-    for module in modules_to_patch:
-        # 确定目标设备 (通常跟随 down_proj)
-        if hasattr(module, "down_proj"):
-            target_device = module.down_proj.weight.device
+    # 隐私与噪声参数
+    noise_sigma: float = field(
+        default=0.0, 
+        metadata={"help": "Noise sigma for DP. MUST be 0.0 during training for router to learn."}
+    )
+    clip_threshold: float = field(default=1.0, metadata={"help": "Gradient clipping threshold"})
+    
+    # LoRA 参数 (需与 expert 训练时一致)
+    r: int = field(default=16)
+    alpha: int = field(default=32)
+    
+    # Router 训练专用参数 (如果不通过 TrainingArguments 传，就用这里的默认值)
+    router_lr: float = field(default=1e-3, metadata={"help": "Learning rate for router"})
+    aux_loss_coef: float = field(default=0.05, metadata={"help": "Coefficient for load balancing loss"})
+
+class RouterTrainer(Trainer):
+    def __init__(self, aux_loss_coef=0.05, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.aux_loss_coef = aux_loss_coef
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # 1. 主任务 Loss
+        if num_items_in_batch is not None:
+             output = super().compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
         else:
-            target_device = list(module.parameters())[0].device
-            
-        # 创建 ModuleDict 容器
-        safe_moes = torch.nn.ModuleDict()
+             output = super().compute_loss(model, inputs, return_outputs=True)
         
-        for adapter_name, moe_layer in module.mixlora_moes.items():
-            # === 1. 处理 Router Gate ===
-            if hasattr(moe_layer, "gate_"):
-                # 转换为 Parameter
-                if not isinstance(moe_layer.gate_, torch.nn.Parameter):
-                    p = torch.nn.Parameter(moe_layer.gate_.to(device=target_device, dtype=torch.bfloat16))
-                    moe_layer.gate_ = p
-                else:
-                    # 已经在 Parameter 里了，确保设备正确
-                    moe_layer.gate_.data = moe_layer.gate_.data.to(device=target_device, dtype=torch.bfloat16)
-                
-                moe_layer.gate_.requires_grad = True
-                patched_routers += 1
+        loss, outputs = output
+        
+        # 2. 负载均衡 Loss
+        if hasattr(model, "module"):
+            aux_loss = model.module.get_aux_loss()
+        else:
+            aux_loss = model.get_aux_loss()
             
-            # === 2. 处理 Experts 容器 (dict -> ModuleDict) ===
-            # MixLoRA 默认用 dict 存 experts，导致 PyTorch 找不到它们
-            if hasattr(moe_layer, "experts_") and isinstance(moe_layer.experts_, dict):
-                safe_experts = torch.nn.ModuleDict()
-                for exp_name, exp_layer in moe_layer.experts_.items():
-                    # 移动 LoRA 权重到 GPU
-                    exp_layer.lora_A.to(target_device)
-                    exp_layer.lora_B.to(target_device)
-                    safe_experts[exp_name] = exp_layer
-                moe_layer.experts_ = safe_experts
-                patched_experts += len(safe_experts)
+        # 3. 总 Loss
+        total_loss = loss + self.aux_loss_coef * aux_loss
+        
+        return (total_loss, outputs) if return_outputs else total_loss
 
-            # === 3. 处理循环引用 ===
-            if "base_layer_" in moe_layer._modules:
-                base = moe_layer._modules["base_layer_"]
-                del moe_layer._modules["base_layer_"]
-                moe_layer.__dict__["base_layer_"] = base
-            
-            safe_moes[adapter_name] = moe_layer
-            
-        # 替换原有的 dict
-        module.mixlora_moes = safe_moes
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        if output_dir is None: output_dir = self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        print(f">>> [Trainer] Saving ONLY Router weights to {output_dir}...")
         
-    print(f">>> Patched {patched_routers} Router Gates and {patched_experts} Expert Containers.")
-    
-    # 额外检查 Shared Attention LoRA
-    for name, module in model.named_modules():
-        if module.__class__.__name__ == "LoraLinear":
-            if hasattr(module, "base_layer_"):
-                target_device = module.base_layer_.weight.device
-                module.lora_A.to(target_device)
-                module.lora_B.to(target_device)
+        model_to_save = self.model.module if hasattr(self.model, "module") else self.model
+        if hasattr(model_to_save, "routers"):
+            torch.save(model_to_save.routers.state_dict(), os.path.join(output_dir, "routers.pt"))
+
+def recursive_clear_quantization_flags(target_obj):
+    flags = ["is_loaded_in_4bit", "is_loaded_in_8bit", "is_quantized"]
+    for f in flags:
+        if hasattr(target_obj, f): setattr(target_obj, f, False)
+    if hasattr(target_obj, "config"):
+        for f in flags:
+            if hasattr(target_obj.config, f): setattr(target_obj.config, f, False)
 
 def train():
     parser = transformers.HfArgumentParser((Arguments, TrainingArguments))
+    args, training_args = parser.parse_args_into_dataclasses()
+
     if len(sys.argv) == 1:
-        print(">>> No args provided, using default arguments...")
+        print(">>> No args provided, using DEFAULT arguments...")
         args, training_args = parser.parse_args_into_dataclasses(args=[
-            "--output_dir", "/root/gpufree-data/OverlappedLoRA/model/router",
-            "--num_train_epochs", "3",
-            "--per_device_train_batch_size", "2",
-            "--gradient_accumulation_steps", "8",
-            "--learning_rate", "1e-4",
+            "--output_dir", "/root/gpufree-data/OverlappedLoRA/model/router",  # 输出路径
+            "--num_train_epochs", "3",                # 训练轮数
+            "--per_device_train_batch_size", "8",     # Batch Size
+            "--gradient_accumulation_steps", "2",     # 梯度累积步数
+            "--learning_rate", "1e-3",                # Router 学习率
             "--logging_steps", "5",
             "--save_steps", "100",
             "--save_total_limit", "2",
-            "--overwrite_output_dir",
-            "--gradient_checkpointing", "True",
-            "--bf16", "True"
+            "--remove_unused_columns", "False",       # 防止 Trainer 删数据
+            "--gradient_checkpointing", "True",       # 开启梯度检查点，节省显存
+            "--bf16", "True",                         # 开启 BF16
+            "--report_to", "none"                     # 不上报 wandb
         ])
     else:
+        # 如果命令行传入了参数，则正常解析
         args, training_args = parser.parse_args_into_dataclasses()
 
-    # 1. Config
-    print(">>> [1/6] Initializing Config...")
-    config_dict = {
-        "base_model_name_or_path": args.base_model,
-        "task_type": "CAUSAL_LM",
-        "peft_type": "MIXLORA",
-        "routing_strategy": "mixlora",
-        "num_experts": args.num_experts,
-        "top_k": 2,
-        "noise_sigma": args.noise_sigma,
-        "clip_threshold": args.clip_threshold,
-        "router_loss": True,
-        "router_aux_loss_coef": 0.01,
-        "router_init_range": 0.02,
-        "r": 16,
-        "lora_alpha": 32,
-        "lora_dropout": 0.05,
-        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        "act_fn": "silu"
-    }
-    config = MixLoraConfig.from_config(config_dict)
-    config.dtype_ = torch.bfloat16
-    config.adapter_name_ = "default"
+    # 强制 Trainer 保留所有列，不要自动删除 input_ids 等
+    training_args.remove_unused_columns = False 
 
-    # 2. Base Model (with 4-bit Quantization)
-    print(f">>> [2/6] Loading Base Model (4-bit)...")
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16
-    )
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
-        quantization_config=bnb_config,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    model = prepare_model_for_kbit_training(model)
-
-    # 3. Stitching
-    print(">>> [3/6] Stitching Experts in Memory...")
-    mixlora_weights = {}
-    attn_accum = {} 
+    print(">>> [1/4] Initializing CoMix Model...")
+    device_id = f"cuda:{training_args.local_rank}" if training_args.local_rank != -1 else "cuda"
     
-    for i in range(args.num_experts):
-        expert_base_path = os.path.join(args.expert_dir, f"expert_{i}")
-        safetensors_path = os.path.join(expert_base_path, "adapter_model.safetensors")
-        bin_path = os.path.join(expert_base_path, "adapter_model.bin")
-
-        if os.path.exists(safetensors_path):
-            expert_state = load_file(safetensors_path)
-        elif os.path.exists(bin_path):
-            expert_state = torch.load(bin_path, map_location="cpu")
-        else:
-            raise FileNotFoundError(f"Expert {i} not found")
-        
-        for k, v in expert_state.items():
-            if "lora_" not in k: continue
-            parts = k.split(".")
-            try:
-                if "layers" in parts:
-                    idx = parts.index("layers")
-                    layer_idx = parts[idx+1]
-                    proj_part = parts[idx+3]
-                    suffix = ".".join(parts[idx+4:])
-                else:
-                    continue
-            except IndexError:
-                continue
-
-            v = v.to(dtype=torch.bfloat16)
-
-            if proj_part in ["gate_proj", "up_proj", "down_proj"]:
-                new_key = f"mixlora.layers.{layer_idx}.mlp.{proj_part}.experts.{i}.{suffix}"
-                mixlora_weights[new_key] = v
-            elif proj_part in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-                attn_key = f"mixlora.layers.{layer_idx}.self_attn.{proj_part}.{suffix}"
-                if attn_key not in attn_accum:
-                    attn_accum[attn_key] = v.float()
-                else:
-                    attn_accum[attn_key] += v.float()
+    model = CoMixModel(
+        base_model_path=args.base_model,
+        num_experts=args.num_experts,
+        r=args.r,
+        alpha=args.alpha,
+        device=device_id
+    )
     
-    for k, v_sum in attn_accum.items():
-        mixlora_weights[k] = (v_sum / args.num_experts).to(dtype=torch.bfloat16)
+    # 设置参数
+    model.noise_sigma = args.noise_sigma
+    model.clip_threshold = args.clip_threshold
+    
+    # 加载专家
+    model.load_experts(args.expert_dir)
 
-    # 4. Router Init
-    print(">>> [4/6] Initializing Router Gates...")
-    hidden_size = model.config.hidden_size
-    for layer_idx in range(model.config.num_hidden_layers):
-        gate_key = f"mixlora.layers.{layer_idx}.mlp.moe_gate.weight"
-        gate_weight = torch.randn(args.num_experts, hidden_size, dtype=torch.bfloat16) * 0.02
-        mixlora_weights[gate_key] = gate_weight
-
-    # 5. Inject
-    print(">>> [5/6] Injecting Adapter...")
-    inject_adapter_in_model(model, config, mixlora_weights)
-
-    # === [核心修复] 调用 Patch 函数 ===
-    patch_mixlora_model(model)
-    # ===============================
-
+    # 冻结参数
+    print(">>> [2/4] Freezing Base Model & Experts...")
     if training_args.gradient_checkpointing:
-        model.enable_input_require_grads()
+        model.model.enable_input_require_grads()
 
-    # Freeze / Unfreeze
-    trainable_count = 0
-    print(">>> Checking parameters for unfreezing:")
+    trainable_params = 0
     for name, param in model.named_parameters():
-        # [Strict Filter] 只训练包含 gate 关键字 且 是浮点类型的参数
-        # 这样可以完美避开 gate_proj (uint8/Params4bit)
-        if ("gate" in name.lower()) and (param.dtype in [torch.bfloat16, torch.float32, torch.float16]):
+        if "routers" in name:
             param.requires_grad = True
-            trainable_count += param.numel()
+            trainable_params += param.numel()
         else:
             param.requires_grad = False
-    
-    print(f">>> [SAFETY CHECK] Total Trainable Parameters: {trainable_count}")
-    
-    if trainable_count == 0:
-        print("!!! DEBUG: Printing all parameter names !!!")
-        for n, p in model.named_parameters():
-            if "gate" in n: print(f"{n} | {p.dtype} | {p.device}")
-        raise ValueError("!!! No trainable parameters found! Please check the logs above. !!!")
+    print(f">>> Trainable Parameters (Routers): {trainable_params}")
 
-    # 6. Training
+    # 数据处理
+    print(">>> [3/4] Loading Dataset...")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-    pad_token_id = tokenizer.pad_token_id
-
+    
     dataset = load_dataset("json", data_files=args.router_data, split="train")
     
     def preprocess(examples):
@@ -275,28 +163,29 @@ def train():
         model_inputs = tokenizer(inputs, padding="max_length", truncation=True, max_length=512)
         
         labels = model_inputs["input_ids"].copy()
-        labels = [
-            [(l if l != pad_token_id else -100) for l in label] 
-            for label in labels
-        ]
+        labels = [[(l if l != tokenizer.pad_token_id else -100) for l in label] for label in labels]
         model_inputs["labels"] = labels
         return model_inputs
 
-    train_ds = dataset.map(preprocess, batched=True)
+    train_ds = dataset.map(preprocess, batched=True, remove_columns=dataset.column_names)
 
-    trainer = Trainer(
+    # Hack Quantization Flags
+    recursive_clear_quantization_flags(model)
+    if hasattr(model, "model"): recursive_clear_quantization_flags(model.model)
+
+    print(">>> [4/4] Starting Training...")
+    trainer = RouterTrainer(
+        aux_loss_coef=args.aux_loss_coef, # 传入 aux loss 系数
         model=model,
         args=training_args,
         train_dataset=train_ds,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         data_collator=DataCollatorForSeq2Seq(tokenizer, pad_to_multiple_of=8, return_tensors="pt"),
     )
 
-    print(">>> Start Training...")
     trainer.train()
-    
-    model.save_pretrained(training_args.output_dir)
-    print(f">>> Model saved to {training_args.output_dir}")
+    trainer.save_model(training_args.output_dir)
+    print(">>> Training Finished.")
 
 if __name__ == "__main__":
     train()
